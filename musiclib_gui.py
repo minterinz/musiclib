@@ -36,8 +36,17 @@ except Exception:  # 单文件打包后可能改名，退化为内置副本
                                iter_flac, open_flac, safe_name, tag,
                                _lrclib_query, _pick)
 
-APP_TITLE = "musiclib 0.1.1 — 音乐库整理工具"
+APP_TITLE = "musiclib 0.1.2 — 音乐库整理工具"
 COLOR_BG = "#f5f6f8"
+
+
+def human(n):
+    f = float(n or 0)
+    for u in ("B", "KB", "MB", "GB"):
+        if f < 1024:
+            return "{:.1f}{}".format(f, u)
+        f /= 1024.0
+    return "{:.1f}TB".format(f)
 
 
 def app_dir():
@@ -164,12 +173,52 @@ class App:
         self.pbar = ttk.Progressbar(f4, mode="determinate")
         self.pbar.pack(side="right", fill="x", expand=True, padx=8)
 
-        # 日志
-        f5 = ttk.LabelFrame(self.root, text=" 4. 日志 ")
-        f5.pack(fill="both", expand=True, **pad)
-        self.txt = tk.Text(f5, wrap="none", bg="#111", fg="#d8ffd8",
+        # 4) 结果区（表格 + 日志两个页签）
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, **pad)
+
+        # ---- 页签一：文件清单表格 ----
+        tab1 = ttk.Frame(nb)
+        nb.add(tab1, text="文件清单")
+
+        bar = ttk.Frame(tab1)
+        bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(bar, text="扫描清单", command=self.scan_table).pack(side="left", padx=4)
+        ttk.Button(bar, text="只看缺项", command=self.filter_missing).pack(side="left", padx=4)
+        ttk.Button(bar, text="显示全部", command=self.filter_all).pack(side="left", padx=4)
+        self.summary = ttk.Label(bar, text="未扫描")
+        self.summary.pack(side="left", padx=12)
+
+        cols = ("title", "artist", "album", "fmt", "dur", "sr", "cover", "lyrics", "size")
+        heads = {"title": ("歌曲标题", 240), "artist": ("艺术家", 150), "album": ("唱片标题", 260),
+                 "fmt": ("格式", 60), "dur": ("时长", 70), "sr": ("规格", 90),
+                 "cover": ("封面", 50), "lyrics": ("歌词", 50), "size": ("大小", 70)}
+        tf = ttk.Frame(tab1)
+        tf.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tf, columns=cols, show="headings", height=14)
+        for c in cols:
+            text, w = heads[c]
+            self.tree.heading(c, text=text,
+                              command=lambda cc=c: self.sort_tree(cc))
+            self.tree.column(c, width=w, anchor="w", stretch=(c in ("title", "album")))
+        ysb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
+        xsb = ttk.Scrollbar(tf, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        tf.rowconfigure(0, weight=1)
+        tf.columnconfigure(0, weight=1)
+        self.tree.tag_configure("miss", background="#FFF3CD")
+        self.tree.tag_configure("ok", background="#EAF7EA")
+        self.tree.bind("<Double-1>", self.on_row_dbl)
+
+        # ---- 页签二：日志 ----
+        tab2 = ttk.Frame(nb)
+        nb.add(tab2, text="日志")
+        self.txt = tk.Text(tab2, wrap="none", bg="#111", fg="#d8ffd8",
                            insertbackground="#d8ffd8", font=("Consolas", 9))
-        sb = ttk.Scrollbar(f5, command=self.txt.yview)
+        sb = ttk.Scrollbar(tab2, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
         self.txt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -186,6 +235,100 @@ class App:
         st = "normal" if self.v_copy.get() else "disabled"
         self.ent_out.configure(state=st)
         self.btn_out.configure(state=st)
+
+    # ------------------------------------------------------------ 表格视图
+    def _source_files(self):
+        if self.mode.get() == "dir":
+            root = Path(self.src_var.get()) if self.src_var.get() else None
+            if not root or not root.is_dir():
+                return []
+            return [p for p in root.rglob("*")
+                    if p.is_file() and p.suffix.lower() in AUDIO_EXT
+                    and DOWNMIX_DIRNAME not in p.parts]
+        return [p for p in self.files if p.exists()]
+
+    def scan_table(self):
+        files = self._source_files()
+        if not files:
+            messagebox.showwarning("提示", "请先选择文件夹或文件")
+            return
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self.summary.configure(text="扫描中… 0/{}".format(len(files)))
+        threading.Thread(target=self._scan_worker, args=(files,), daemon=True).start()
+
+    def _scan_worker(self, files):
+        rows = []
+        for i, p in enumerate(files, 1):
+            title = artist = album = ""
+            fmt = p.suffix.lower().lstrip(".")
+            dur = sr = "-"
+            has_cover = has_lyric = False
+            try:
+                size = p.stat().st_size
+            except OSError:
+                size = 0
+            f = open_flac(p)
+            if f is not None:
+                title = tag(f, "title") or p.stem
+                artist = tag(f, "artist") or tag(f, "albumartist")
+                album = tag(f, "album")
+                secs = int(f.info.length or 0)
+                dur = "{}:{:02d}".format(secs // 60, secs % 60)
+                sr = "{}Hz/{}bit".format(f.info.sample_rate, f.info.bits_per_sample)
+                if f.info.channels > 2:
+                    sr += "/{}ch".format(f.info.channels)
+                has_cover = bool(f.pictures)
+                has_lyric = bool(f.get("lyrics") or f.get("unsyncedlyrics"))
+            else:
+                title = p.stem
+                fmt += "?"
+            rows.append((title, artist, album, fmt, dur, sr,
+                         "✓" if has_cover else "✗",
+                         "✓" if has_lyric else "✗",
+                         human(size) if isinstance(size, int) else "-"))
+            if i % 50 == 0:
+                self.q.put(("tablescan", (i, len(files), None)))
+        self.q.put(("tablescan", (len(files), len(files), rows)))
+
+    def _fill_table(self, rows):
+        for r in rows:
+            miss = ("✗" in (r[6], r[7]))
+            self.tree.insert("", "end", values=r, tags=("miss",) if miss else ("ok",))
+        total = len(rows)
+        no_cover = sum(1 for r in rows if r[6] == "✗")
+        no_lyric = sum(1 for r in rows if r[7] == "✗")
+        self.summary.configure(
+            text="共 {} 个 · 缺封面 {} · 缺歌词 {}".format(total, no_cover, no_lyric))
+
+    def filter_missing(self):
+        for iid in self.tree.get_children():
+            v = self.tree.item(iid, "values")
+            if v and (v[6] == "✗" or v[7] == "✗"):
+                self.tree.move(iid, "", "end")
+
+    def filter_all(self):
+        for iid in self.tree.get_children():
+            self.tree.move(iid, "", "end")
+
+    def sort_tree(self, col):
+        idx = self.tree["columns"].index(col)
+        items = [(self.tree.item(i, "values"), i) for i in self.tree.get_children()]
+
+        def keyf(t):
+            v = t[0][idx] if idx < len(t[0]) else ""
+            return (v == "✗", str(v).lower())
+        items.sort(key=keyf, reverse=getattr(self, "_desc", False))
+        self._desc = not getattr(self, "_desc", False)
+        for pos, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", pos)
+
+    def on_row_dbl(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        v = self.tree.item(sel[0], "values")
+        messagebox.showinfo("条目", "标题: {}\n艺术家: {}\n唱片: {}\n格式: {}\n时长: {}\n规格: {}\n封面: {}\n歌词: {}".format(*v))
 
     # ------------------------------------------------------------ 选择
     def pick_dir(self):
@@ -692,6 +835,12 @@ class App:
                 elif kind == "tick":
                     self.pbar.configure(value=payload)
                     self.status.configure(text="进度 {}/{}".format(payload, int(self.pbar["maximum"])))
+                elif kind == "tablescan":
+                    done, total, rows = payload
+                    if rows is not None:
+                        self._fill_table(rows)
+                    else:
+                        self.summary.configure(text="扫描中… {}/{}".format(done, total))
                 elif kind == "done":
                     self.status.configure(text=payload)
                     self.btn_run.configure(state="normal")

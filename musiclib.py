@@ -624,6 +624,143 @@ def cmd_lyrics(args, log):
     return 0
 
 
+
+# ---------------------------------------------------------------- lyricfmt
+LRC_TAG = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+AD_WORDS = ("本歌词", "歌词制作", "歌词下载", "歌词由", "爱歌词", "欢迎光临",
+            "www.", "http://", "https://", "QQ群", "千千静听", "酷狗音乐", "网易云音乐",
+            "版权所有", "LRC歌词网", "整理制作")
+
+
+def lrc_parse(text):
+    """LRC -> [(秒, 文本)]，支持一行多时间标签。"""
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        stamps = list(LRC_TAG.finditer(line))
+        if not stamps:
+            continue
+        body = LRC_TAG.sub("", line).strip()
+        for m in stamps:
+            mm, ss, frac = m.group(1), m.group(2), m.group(3) or "0"
+            frac = (frac + "00")[:3]
+            t = int(mm) * 60 + int(ss) + int(frac) / 1000.0
+            out.append((t, body))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def lrc_clean(items, offset=0.0, strip_ads=False):
+    res = []
+    for t, body in items:
+        if strip_ads and body and any(w in body for w in AD_WORDS):
+            continue
+        nt = max(0.0, t + offset)
+        if not body:
+            continue
+        res.append((nt, body))
+    return res
+
+
+def to_srt(items):
+    def ts(x):
+        h = int(x // 3600)
+        m = int(x % 3600 // 60)
+        sec = int(x % 60)
+        ms = int(round((x - int(x)) * 1000))
+        if ms == 1000:
+            ms = 0
+            sec += 1
+        return "{:02d}:{:02d}:{:02d},{:03d}".format(h, m, sec, ms)
+    out = []
+    for i, (t, body) in enumerate(items, 1):
+        end = items[i][0] if i < len(items) else t + 4.0
+        if end <= t:
+            end = t + 2.0
+        out.append("{}\n{} --> {}\n{}\n".format(i, ts(t), ts(end), body))
+    return "\n".join(out)
+
+
+def to_ass(items, title=""):
+    def ts(x):
+        h = int(x // 3600)
+        m = int(x % 3600 // 60)
+        s = x % 60
+        return "{:d}:{:02d}:{:05.2f}".format(h, m, s)
+    head = (
+        "[Script Info]\nScriptType: v4.00+\nTitle: {}\nPlayResX: 1280\nPlayResY: 720\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "0,0,0,0,100,100,0,0,1,2,2,2,20,20,30,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    ).format(title)
+    lines = []
+    for i, (t, body) in enumerate(items):
+        end = items[i + 1][0] if i + 1 < len(items) else t + 4.0
+        if end <= t:
+            end = t + 2.0
+        lines.append("Dialogue: 0,{},{},Default,,0,0,0,,{}".format(ts(t), ts(end), body))
+    return head + "\n".join(lines) + "\n"
+
+
+def to_txt(items):
+    return "\n".join(body for _, body in items) + "\n"
+
+
+def to_lrc(items):
+    def ts(x):
+        m = int(x // 60)
+        s = x - m * 60
+        return "[{:02d}:{:05.2f}]".format(m, s)
+    return "\n".join("{}{}".format(ts(t), body) for t, body in items) + "\n"
+
+
+CONVERTERS = {"lrc": to_lrc, "srt": to_srt, "ass": to_ass, "txt": to_txt}
+
+
+def cmd_lyricfmt(args, log):
+    src = Path(args.root)
+    files = [src] if src.is_file() else [p for p in src.rglob("*.lrc") if p.is_file()]
+    if not files:
+        log("lyricfmt", "没有找到 .lrc 文件", root=str(src))
+        return 0
+    outdir = Path(args.out) if args.out else None
+    if outdir:
+        outdir.mkdir(parents=True, exist_ok=True)
+    done = 0
+    for p in files:
+        try:
+            text = p.read_text(encoding=args.encoding, errors="replace")
+        except Exception as exc:
+            log("lyricfmt", "读取失败 {}".format(exc), file=str(p))
+            continue
+        items = lrc_parse(text)
+        if not items:
+            log("lyricfmt", "无时间标签，跳过 {}".format(p.name[:50]))
+            continue
+        items = lrc_clean(items, args.offset, args.strip_ads)
+        for fmt in args.to:
+            conv = CONVERTERS.get(fmt)
+            if not conv:
+                continue
+            body = conv(items) if fmt != "ass" else conv(items, title=p.stem)
+            dst = (outdir or p.parent) / (p.stem + "." + fmt)
+            log("lyricfmt", "{} -> {}  {} 行".format(p.name[:40], dst.name, len(items)))
+            if args.apply:
+                dst.write_text(body, encoding="utf-8")
+                done += 1
+    log("lyricfmt", "结束", 文件=len(files), 输出=done,
+        格式=",".join(args.to), 偏移=args.offset, 去广告=args.strip_ads,
+        模式="apply" if args.apply else "dry-run")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
     try:
@@ -694,6 +831,19 @@ def main(argv=None):
     common(p, applyable=False)
     p.add_argument("--out", help="报告输出目录")
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("lyricfmt", help="歌词格式互转与清洗（LRC -> SRT/ASS/TXT/LRC）")
+    p.add_argument("--root", required=True, help=".lrc 文件或含 .lrc 的目录")
+    p.add_argument("--to", nargs="+", default=["srt"], choices=["lrc", "srt", "ass", "txt"])
+    p.add_argument("--offset", type=float, default=0.0, help="时间整体偏移秒数，可负数")
+    p.add_argument("--strip-ads", action="store_true", help="删除广告/来源行")
+    p.add_argument("--encoding", default="utf-8", help="源文件编码，如 gbk")
+    p.add_argument("--out", help="输出目录（默认与源同目录）")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--log")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--show", type=int, default=20)
+    p.set_defaults(func=cmd_lyricfmt)
 
     p = sub.add_parser("lyrics", help="批量取歌词写入 FLAC 标签（源 lrclib.net）")
     common(p)
