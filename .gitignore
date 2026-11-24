@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+bin/
+dist/
+build/
+*.spec
+*.exe
+*.zip
+cache/
+*.jsonl
+_musiclib报告/
