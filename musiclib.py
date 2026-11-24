@@ -514,6 +514,116 @@ def cmd_verify(args, log):
     return 0
 
 
+
+# ---------------------------------------------------------------- lyrics
+LRCLIB = "https://lrclib.net/api/search"
+LRCLIB_UA = "musiclib/0.1 (https://github.com/minterinz/musiclib)"
+LRCLIB_MIN_INTERVAL = 1.0        # 每秒最多 1 次，官方要求别打太猛
+_last_call = [0.0]
+
+
+def _lrclib_query(artist, title, album):
+    """返回候选列表；失败返回空。"""
+    import urllib.parse
+    import urllib.request
+
+    params = {"track_name": title}
+    if artist:
+        params["artist_name"] = artist
+    if album:
+        params["album_name"] = album
+    url = LRCLIB + "?" + urllib.parse.urlencode(params)
+    gap = time.time() - _last_call[0]
+    if gap < LRCLIB_MIN_INTERVAL:
+        time.sleep(LRCLIB_MIN_INTERVAL - gap)
+    _last_call[0] = time.time()
+    req = urllib.request.Request(url, headers={"User-Agent": LRCLIB_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _pick(cands, duration=None):
+    """优先时长最接近、且有同步歌词的候选。"""
+    if not cands:
+        return None
+    best, best_score = None, 1e9
+    for c in cands:
+        if not (c.get("syncedLyrics") or c.get("plainLyrics")):
+            continue
+        score = 0.0
+        if duration:
+            d = c.get("duration")
+            if d:
+                score += abs(float(d) - float(duration))
+            else:
+                score += 5
+        if not c.get("syncedLyrics"):
+            score += 2
+        if score < best_score:
+            best, best_score = c, score
+    if best is None:
+        return None
+    if duration and best.get("duration"):
+        if abs(float(best["duration"]) - float(duration)) > 10:
+            return None
+    return best
+
+
+def cmd_lyrics(args, log):
+    root = Path(args.root)
+    want_lrc = args.save_lrc
+    done = skip = miss = fail = 0
+    for p in iter_flac(root):
+        if args.limit and (done + skip + miss + fail) >= args.limit:
+            break
+        f = open_flac(p)
+        if f is None:
+            fail += 1
+            continue
+        if (f.get("lyrics") or f.get("unsyncedlyrics")) and not args.overwrite:
+            skip += 1
+            continue
+        artist = tag(f, "artist") or tag(f, "albumartist")
+        title = tag(f, "title")
+        album = tag(f, "album")
+        if not title:
+            miss += 1
+            continue
+        cands = _lrclib_query(artist, title, album)
+        hit = _pick(cands, f.info.length if f.info.length else None)
+        if hit is None:
+            miss += 1
+            log("lyrics", "未找到 {}".format(p.name[:56]), artist=artist)
+            continue
+        synced = hit.get("syncedLyrics") or ""
+        plain = hit.get("plainLyrics") or ""
+        log("lyrics", "{} <- {} ({})".format(p.name[:50], hit.get("trackName", "")[:30],
+                                            "同步" if synced else "纯文本"))
+        if not args.apply:
+            done += 1
+            continue
+        try:
+            if synced:
+                f["LYRICS"] = synced
+            elif plain:
+                f["UNSYNCEDLYRICS"] = plain
+            f.save()
+            if want_lrc:
+                side = p.with_suffix(".lrc")
+                side.write_text(synced or plain, encoding="utf-8")
+            done += 1
+        except Exception as exc:
+            fail += 1
+            log("lyrics", "写入失败 {}".format(exc), file=str(p))
+    log("lyrics", "结束", 写入=done, 已有=skip, 未找到=miss, 失败=fail,
+        源="lrclib.net", 模式="apply" if args.apply else "dry-run")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
     try:
@@ -584,6 +694,13 @@ def main(argv=None):
     common(p, applyable=False)
     p.add_argument("--out", help="报告输出目录")
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("lyrics", help="批量取歌词写入 FLAC 标签（源 lrclib.net）")
+    common(p)
+    p.add_argument("--overwrite", action="store_true", help="已有歌词也覆盖")
+    p.add_argument("--save-lrc", action="store_true", help="同时存同名 .lrc 文件")
+    p.add_argument("--limit", type=int, help="只处理前 N 个（试跑用）")
+    p.set_defaults(func=cmd_lyrics)
 
     args = ap.parse_args(argv)
 

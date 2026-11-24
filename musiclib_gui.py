@@ -29,12 +29,14 @@ from tkinter import filedialog, messagebox, ttk
 # 复用核心逻辑
 try:
     from musiclib import (AUDIO_EXT, DOWNMIX_DIRNAME, PAN, build_name,
-                          iter_flac, open_flac, safe_name)
+                          iter_flac, open_flac, safe_name, tag,
+                          _lrclib_query, _pick)
 except Exception:  # 单文件打包后可能改名，退化为内置副本
     from musiclib_core import (AUDIO_EXT, DOWNMIX_DIRNAME, PAN, build_name,
-                               iter_flac, open_flac, safe_name)
+                               iter_flac, open_flac, safe_name, tag,
+                               _lrclib_query, _pick)
 
-APP_TITLE = "musiclib 0.1 — 音乐库整理工具"
+APP_TITLE = "musiclib 0.1.1 — 音乐库整理工具"
 COLOR_BG = "#f5f6f8"
 
 
@@ -107,6 +109,7 @@ class App:
         self.v_flatten = tk.BooleanVar(value=True)
         self.v_cover = tk.BooleanVar(value=True)
         self.v_downmix = tk.BooleanVar(value=True)
+        self.v_lyrics = tk.BooleanVar(value=True)
         self.v_cleanup = tk.BooleanVar(value=False)
         self.v_copy = tk.BooleanVar(value=False)
 
@@ -127,8 +130,10 @@ class App:
 
         ttk.Checkbutton(f2, text="5.1 → 立体声降混（BS.775 权重，-3dB 防削波）",
                         variable=self.v_downmix).grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+        ttk.Checkbutton(f2, text="歌词内嵌（源 lrclib.net，写入 FLAC 的 LYRICS 标签，可另存 .lrc）",
+                        variable=self.v_lyrics).grid(row=4, column=0, columnspan=4, sticky="w", padx=8, pady=2)
         ttk.Checkbutton(f2, text="清理旧文件（新集覆盖校验通过才删，危险，需二次确认）",
-                        variable=self.v_cleanup).grid(row=4, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+                        variable=self.v_cleanup).grid(row=5, column=0, columnspan=4, sticky="w", padx=8, pady=2)
 
         # 输出
         f3 = ttk.LabelFrame(self.root, text=" 3. 输出位置 ")
@@ -242,6 +247,7 @@ class App:
             "cover_mode": self.cover_mode.get(),
             "cover_path": self.cover_path.get(),
             "downmix": self.v_downmix.get(),
+            "lyrics": self.v_lyrics.get(),
             "cleanup": self.v_cleanup.get(),
             "copy": self.v_copy.get(),
             "out": self.out_var.get(),
@@ -489,6 +495,64 @@ class App:
                             log("  降混异常: {}".format(exc))
                     self._tick()
                 log("{}降混完成 {} 个，失败 {} 个".format(tag, cnt, fail))
+
+        # ---------------- 4.5) 歌词内嵌 ----------------
+        if o.get("lyrics"):
+            log("{}—— 歌词内嵌 ——".format(tag))
+            got = have = miss = fail = 0
+            for p in files:
+                if self.stop_flag.is_set():
+                    log("已停止")
+                    return
+                f = open_flac(p)
+                if f is None:
+                    fail += 1
+                    self._tick()
+                    continue
+                if f.get("lyrics") or f.get("unsyncedlyrics"):
+                    have += 1
+                    self._tick()
+                    continue
+                artist = tag(f, "artist") or tag(f, "albumartist")
+                title = tag(f, "title")
+                album = tag(f, "album")
+                if not title:
+                    miss += 1
+                    self._tick()
+                    continue
+                try:
+                    cands = _lrclib_query(artist, title, album)
+                    hit = _pick(cands, f.info.length if f.info.length else None)
+                except Exception as exc:
+                    fail += 1
+                    log("  歌词查询异常: {}".format(exc))
+                    self._tick()
+                    continue
+                if hit is None:
+                    miss += 1
+                    log("{}  未找到歌词: {}".format(tag, p.name[:52]))
+                    self._tick()
+                    continue
+                synced = hit.get("syncedLyrics") or ""
+                plain = hit.get("plainLyrics") or ""
+                log("{}  {} <- {}".format(tag, p.name[:46],
+                                          hit.get("trackName", "")[:34]))
+                if not dry:
+                    try:
+                        if synced:
+                            f["LYRICS"] = synced
+                        else:
+                            f["UNSYNCEDLYRICS"] = plain
+                        f.save()
+                        got += 1
+                    except Exception as exc:
+                        fail += 1
+                        log("  写入失败: {}".format(exc))
+                else:
+                    got += 1
+                self._tick()
+            log("{}歌词完成：写入 {}，已有 {}，未找到 {}，失败 {}".format(
+                tag, got, have, miss, fail))
 
         # ---------------- 5) 清理旧文件 ----------------
         if o["cleanup"] and o["mode"] == "dir":

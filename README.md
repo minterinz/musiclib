@@ -16,7 +16,7 @@
 | `cover` | 封面内嵌：同目录图片 / 统一图片 / 向上找父目录图片 |
 | `downmix` | 5.1 → 立体声（ITU-R BS.775 权重，−3 dB 防削波） |
 | `cleanup` | 旧文件清理（需覆盖校验通过） |
-| `verify` | 库体检：0Hz/0bit、无封面、空目录、ISO/DSD 残留 |
+| `lyrics` | 批量取歌词（源 [lrclib.net](https://lrclib.net)，免登录）写入 FLAC 的 `LYRICS` 标签，可另存 `.lrc` |`n| `verify` | 库体检：0Hz/0bit、无封面、空目录、ISO/DSD 残留 |
 | `fixall.py` | 全库批量：跨格式改名（含清洗标签内曲号）+ 批量补封面 |
 
 ## 安装
@@ -51,7 +51,7 @@ python musiclib.py flatten --root /mnt/sd --apply --prune-empty
 python musiclib.py cover   --root /mnt/sd --image cover.jpg --apply
 python musiclib.py downmix --root /mnt/sd --apply --delete-source
 python musiclib.py cleanup --root /mnt/sd --old-rate 44100 --apply --force
-python musiclib.py verify  --root /mnt/sd
+python musiclib.py verify  --root /mnt/sd`npython musiclib.py lyrics  --root /mnt/sd --apply --save-lrc
 ```
 
 全库批量（推荐用这个，覆盖 mp3/dsf/wav）：
@@ -88,6 +88,12 @@ pyinstaller --noconfirm --onefile --windowed --name musiclib `
 - 大库在 U 盘上跑封面很慢（整文件重写，约 7 个/分钟），属物理限制
 - 设备中途掉线时，早期版本会把「目录不可读」误记为「无图」，已在 0.1 修正为记失败
 
-## 许可
+'## 歌词
+
+`lyrics` 用 lrclib.net 的公开 API（无需登录）。匹配依据：标题 + 歌手 + 专辑，并按**时长差 ≤10 秒**过滤，避免配错歌。命中的同步歌词写入 FLAC 的 `LYRICS` 标签（DAP 可直接显示滚动歌词），纯文本写 `UNSYNCEDLYRICS`；`--save-lrc` 额外存同名 `.lrc`。
+
+官方建议每秒不超过 1 次请求，工具内置 1 秒间隔。
+
+## 许可'
 
 MIT，见 [LICENSE](LICENSE)。
