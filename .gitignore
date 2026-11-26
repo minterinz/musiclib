@@ -11,3 +11,18 @@ build/
 cache/
 *.jsonl
 _musiclib报告/
+# 临时脚本 / 备份 / 截图 / 缓存 —— 不进仓库
+_*.py
+_*.json
+_*.png
+_*.progress
+*.bak
+*.bak_*
+*.bak[0-9]
+docs/
+logs/
+list_cache.json
+split_done.json
+state.json
+library_snapshot.py
+lyriceng.py

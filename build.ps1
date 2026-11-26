@@ -6,8 +6,11 @@ Set-Location $PSScriptRoot
 python -m pip install --quiet --upgrade pyinstaller | Out-Null
 
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name musiclib `
-    --hidden-import mutagen --hidden-import mutagen.flac `
+    --hidden-import mutagen --hidden-import mutagen.flac --hidden-import mutagen.id3 `
     --hidden-import PIL --hidden-import PIL.Image `
+    --hidden-import lyriceng `
+    --hidden-import opencc --hidden-import pypinyin `
+    --collect-data opencc --collect-data pypinyin `
     --exclude-module numpy --exclude-module matplotlib --exclude-module scipy `
     musiclib_gui.py
 

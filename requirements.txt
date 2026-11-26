@@ -1,2 +1,4 @@
 mutagen>=1.47
 pillow>=9.0
+opencc-python-reimplemented>=0.1.7
+pypinyin>=0.51

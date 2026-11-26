@@ -21,9 +21,24 @@ import argparse
 import csv
 import json
 import os
+
+
+def run_hidden(args, **kw):
+    """跑外部程序但不弹控制台窗口。
+
+    --windowed 打包后 subprocess 默认会拉起一个黑色 cmd 窗口，
+    每次转码/分割都在屏幕上闪一下（2026-11-30 用户报「前台弹 cmd 窗口」）。
+    Windows 上必须显式给 CREATE_NO_WINDOW。
+    """
+    import subprocess as _sp
+    if os.name == "nt":
+        kw["creationflags"] = getattr(_sp, "CREATE_NO_WINDOW", 0x08000000)
+    return _sp.run(args, **kw)
+
 import re
 import shutil
 import subprocess
+import time as _time
 import sys
 import time
 from pathlib import Path
@@ -40,6 +55,30 @@ BAD_CHARS = r'[\\/:*?"<>|]'
 
 
 # ---------------------------------------------------------------- 基础设施
+# 只读保护盘：用户明确要求 Z:\download\music 是保种源，任何写操作都不许碰。
+# 用环境变量可扩展：MUSICLIB_READONLY_ROOTS="z:\;d:\xxx"（分号分隔）
+READONLY_ROOTS = [x.strip().lower().rstrip("\\")
+                  for x in os.environ.get("MUSICLIB_READONLY_ROOTS", "z:").split(";")
+                  if x.strip()]
+
+
+def assert_writable(root, apply: bool, log=None):
+    """执行写操作前校验目标盘不是保种源。apply=False（dry-run）不拦。"""
+    if not apply:
+        return
+    try:
+        rp = str(Path(root).resolve()).lower().rstrip("\\")
+    except Exception:
+        return
+    for g in READONLY_ROOTS:
+        if rp == g or rp.startswith(g + "\\"):
+            msg = ("拒绝写入：{} 在只读保护列表里（{}）。"
+                   "保种源不得修改 —— 请先复制到 I: 盘，只改副本。").format(root, g)
+            if log:
+                log("guard", msg)
+            raise SystemExit(2)
+
+
 class Log:
     def __init__(self, path: Path = None, quiet=False):
         self.quiet = quiet
@@ -98,6 +137,816 @@ def open_flac(p):
         return FLAC(p)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------- 封面查找
+IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+# 明显不是封面的图（封底、碟面、内页、书脊…）：仅在"按名字找不到"时用来排除
+NON_COVER_WORDS = ("back", "rear", "disc", "cd", "dvd", "booklet", "inlay", "tray",
+                   "inside", "inner", "obi", "spine", "matrix", "label", "封底",
+                   "碟面", "内页", "书脊", "背面")
+
+# 常见封面文件名（越靠前越优先）
+COVER_NAMES = ("cover", "folder", "front", "albumart", "albumartlarge", "albumartsmall",
+               "album", "jacket", "artwork", "case", "thumb", "封面", "封底")
+# 常见存放图片的子目录名
+COVER_SUBDIRS = ("artwork", "artworks", "scans", "scan", "covers", "cover", "art",
+                 "booklet", "images", "pictures", "jpg", "图片", "封面", "扫图", "bk")
+
+
+def _img_rank(p: Path):
+    stem = p.stem.strip().lower()
+    for i, key in enumerate(COVER_NAMES):
+        if stem == key:
+            return (0, i, p.name)
+    for i, key in enumerate(COVER_NAMES):
+        if stem.startswith(key):
+            return (1, i, p.name)
+    return (2, 99, p.name)
+
+
+def _list_images(d: Path):
+    """列目录下的图片；目录读不动时抛 OSError（便于区分「没有图」和「读不到」）。"""
+    out = []
+    for e in d.iterdir():
+        try:
+            if e.is_file() and e.suffix.lower() in IMG_EXT:
+                out.append(e)
+        except OSError:
+            continue
+    return out
+
+
+def _best_image(d: Path):
+    imgs = _list_images(d)
+    if not imgs:
+        return None
+    imgs.sort(key=_img_rank)
+    best = imgs[0]
+    if _img_rank(best)[0] == 2 and len(imgs) > 1:
+        try:  # 全是不认识的名字，挑体积最大的（主封面通常比缩略图大）
+            imgs.sort(key=lambda x: x.stat().st_size, reverse=True)
+            best = imgs[0]
+        except OSError:
+            pass
+    return best
+
+
+def find_cover_image(p: Path, root: Path = None, max_up: int = 3):
+    """按优先级找可用封面图。
+
+    顺序：本目录常见封面名 → 本目录唯一一张图 → 向下 Artwork/Scans 等子目录
+          → 向上最多 max_up 层父目录（不越过 root）
+
+    返回 (图片路径 或 None, 来源说明 或 失败原因, 是否属于「目录读不动」)
+    """
+    root_p = Path(root) if root else None
+
+    def within(d: Path):
+        if root_p is None:
+            return True
+        try:
+            d.resolve().relative_to(root_p.resolve())
+            return True
+        except Exception:
+            return False
+
+    # 1) 本目录
+    try:
+        same = _list_images(p.parent)
+    except OSError as exc:
+        return (None, "目录不可读（{}）".format(exc.__class__.__name__), True)
+    named = [e for e in same if _img_rank(e)[0] <= 1]
+    if named:
+        named.sort(key=_img_rank)
+        return (named[0], "本目录", False)
+    if len(same) == 1:
+        return (same[0], "本目录(唯一图)", False)
+    # 兜底：名字不规范（IMG_0001.bmp / 扫描1.JPG / img001.jpg 这类）
+    # 排除明显不是封面的（封底/碟面/内页），剩下的按体积取最大
+    if same:
+        cand = [
+            e for e in same
+            if not any(w in e.stem.lower() for w in NON_COVER_WORDS)
+        ]
+        if not cand:
+            cand = same
+        try:
+            cand.sort(key=lambda e: e.stat().st_size, reverse=True)
+        except OSError:
+            pass
+        return (cand[0], "本目录(按大小取最大的图)", False)
+
+    # 2) 向下找 Artwork / Scans / Covers 等子目录
+    try:
+        subs = [e for e in p.parent.iterdir() if e.is_dir()]
+    except OSError as exc:
+        return (None, "目录不可读（{}）".format(exc.__class__.__name__), True)
+    for sub in subs:
+        if sub.name.lower() not in COVER_SUBDIRS:
+            continue
+        try:
+            hit = _best_image(sub)
+        except OSError:
+            continue
+        if hit:
+            return (hit, "子目录 {}".format(sub.name), False)
+
+    # 3) 向上找父目录（库根不算专辑，不能拿根上的图充当封面）
+    d = p.parent
+    for _ in range(max_up):
+        parent = d.parent
+        if not within(parent):
+            break
+        if root_p is not None:
+            try:
+                if parent.resolve() == root_p.resolve():
+                    break
+            except Exception:
+                pass
+        d = parent
+        try:
+            hit = _best_image(d)
+        except OSError:
+            continue
+        if hit:
+            return (hit, "上级 {}".format(d.name or str(d)), False)
+    return (None, "目录链上没有可用图片", False)
+
+
+def wav_to_flac(p: Path, ffmpeg="ffmpeg", verify=True) -> Path:
+    """WAV → FLAC，逐字节无损。返回新文件路径；失败抛异常。
+
+    为什么值得转：FLAC 是完全无损的压缩格式，解码后与 WAV 的 PCM 逐字节相同
+    （用 -f s32le 原始样本算 MD5 可验证），体积通常小 35-45%；
+    而且 Windows 资源管理器能给 FLAC 画封面缩略图，WAV 不行。
+
+    保留：采样率 / 位深 / 声道数一律不动，标签和封面跟着过去。
+    安全：先写 .w2f.tmp.flac，校验通过才改名；原 WAV 不动（删不删由调用方决定）。
+    """
+    import hashlib
+    import subprocess
+
+    p = Path(p)
+    if p.suffix.lower() != ".wav":
+        raise RuntimeError("不是 WAV：{}".format(p.name))
+    dst = p.with_suffix(".flac")
+    if dst.exists():
+        raise RuntimeError("目标已存在，跳过：{}".format(dst.name))
+
+    tmp = p.with_name(p.stem + ".w2f.tmp.flac")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    r = run_hidden(
+        [ffmpeg, "-y", "-v", "error", "-i", str(p),
+         "-map", "0:a:0", "-c:a", "flac", "-compression_level", "8",
+         "-map_metadata", "0", str(tmp)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not tmp.exists():
+        raise RuntimeError("ffmpeg 转换失败：{}".format((r.stderr or "")[:300]))
+
+    if verify:
+        def raw_md5(path):
+            q = run_hidden(
+                [ffmpeg, "-v", "error", "-i", str(path), "-map", "0:a:0",
+                 "-f", "s32le", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            return hashlib.md5(q.stdout).hexdigest()
+
+        try:
+            m1 = raw_md5(p)
+            m2 = raw_md5(tmp)
+        except Exception as exc:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError("无损校验执行失败：{}".format(exc))
+        if m1 != m2:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                "无损校验不一致（WAV {} vs FLAC {}），已放弃".format(m1[:12], m2[:12]))
+
+    # 把封面重写成 JPEG 并补 width/height/depth（Windows 靠这几个字段画缩略图）
+    try:
+        raw_cover = get_cover_bytes(p)
+        if raw_cover:
+            img = p.with_name(p.stem + ".w2f.cover.jpg")
+            img.write_bytes(raw_cover)
+            embed_cover(tmp, img, max_px=700)
+    except Exception:
+        pass  # allow-swallow: 封面补写失败不影响音频，转出来的 FLAC 仍然可用
+
+    os.replace(tmp, dst)
+    return dst
+
+
+def _cue_read_text(cue: Path) -> str:
+    """cue 编码很杂（GBK/Big5/UTF-8），按序试，返回第一个能解的。"""
+    raw = Path(cue).read_bytes()
+    for enc in ("utf-8-sig", "utf-8", "gbk", "big5", "utf-16"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _cue_time_to_sec(t: str) -> float:
+    """cue 的 mm:ss:ff 转秒（ff 是 1/75 秒的帧）。"""
+    parts = t.strip().split(":")
+    if len(parts) == 3:
+        m, s, f = parts
+        return int(m) * 60 + int(s) + int(f) / 75.0
+    if len(parts) == 2:
+        m, s = parts
+        return int(m) * 60 + int(s)
+    return float(t)
+
+
+def parse_cue(cue: Path):
+    """解析 cue，返回 (音频文件名, [ {index, title, performer, start, end} ])。
+
+    end 由下一轨的 start 推出，最后一轨为 None（用总时长）。
+    """
+    text = _cue_read_text(cue)
+    files = re.findall(r'^\s*FILE\s+"([^"]+)"', text, re.M) or \
+            re.findall(r'^\s*FILE\s+(\S+)', text, re.M)
+    if not files:
+        raise RuntimeError("cue 里没有 FILE 行")
+
+    disc_title = ""
+    m = re.search(r'^\s*TITLE\s+"([^"]*)"', text, re.M)
+    if m:
+        disc_title = m.group(1).strip()
+    disc_perf = ""
+    m = re.search(r'^\s*PERFORMER\s+"([^"]*)"', text, re.M)
+    if m:
+        disc_perf = m.group(1).strip()
+
+    tracks = []
+    cur = None
+    for line in text.splitlines():
+        s = line.strip()
+        mt = re.match(r'TRACK\s+(\d+)\s+AUDIO', s, re.I)
+        if mt:
+            if cur:
+                tracks.append(cur)
+            cur = {"index": int(mt.group(1)), "title": "", "performer": "",
+                   "start": None, "end": None}
+            continue
+        if cur is None:
+            continue
+        mti = re.match(r'TITLE\s+"([^"]*)"', s, re.I)
+        if mti:
+            cur["title"] = mti.group(1).strip(); continue
+        mip = re.match(r'PERFORMER\s+"([^"]*)"', s, re.I)
+        if mip:
+            cur["performer"] = mip.group(1).strip(); continue
+        mi = re.match(r'INDEX\s+01\s+(\d+:\d+:\d+)', s, re.I)
+        if mi:
+            cur["start"] = _cue_time_to_sec(mi.group(1))
+    if cur:
+        tracks.append(cur)
+
+    tracks = [t for t in tracks if t["start"] is not None]
+    for i, t in enumerate(tracks):
+        t["end"] = tracks[i + 1]["start"] if i + 1 < len(tracks) else None
+    return files[0], tracks, disc_title, disc_perf
+
+
+def find_cue_audio(cue: Path, cue_file_name: str):
+    """cue 里写的音频可能已经转成别的格式，按扩展名轮着找。"""
+    want = Path(cue_file_name)
+    cand = cue.parent / want.name
+    if cand.exists():
+        return cand
+    for ext in (".flac", ".wav", ".ape", ".wv", ".tta", ".aiff", ".aif", ".dsf", ".dff", ".mp3"):
+        c2 = cand.with_suffix(ext)
+        if c2.exists():
+            return c2
+    return None
+
+
+def split_cue_album(cue: Path, ffmpeg="ffmpeg", apply=True, out_dir: Path = None,
+                    on_track=None):
+    """把一个「单文件 cue + 整轨音频」按 cue 分轨，一个字节都不重新编码。
+
+    返回 (音频路径, [要生成的分轨路径...])；apply=False 时只算计划。
+
+    on_track(i, total, out_path, track_dict)：每切完一轨回调一次，
+    让调用方能把"第几轨/共几轨/曲名"写进日志——否则切 16 轨静默 15 秒，
+    用户根本不知道在干什么（2026-11-30 用户原话：「进度你得写进日志里啊」）。
+    """
+    import subprocess
+
+    cue = Path(cue)
+    files, tracks, disc_title, disc_perf = parse_cue(cue)
+    if not tracks:
+        raise RuntimeError("cue 里没有可用 TRACK")
+    audio = find_cue_audio(cue, files)
+    if audio is None:
+        raise RuntimeError("cue 指向的音频不存在：{}".format(files))
+    if len(set([files])) != 1:
+        raise RuntimeError("多文件 cue（分轨索引），不需要分割")
+
+    dest = Path(out_dir) if out_dir else cue.parent
+    dest.mkdir(parents=True, exist_ok=True)
+
+    width = 2 if len(tracks) >= 10 else 1
+    planned = []
+    for t in tracks:
+        name = t["title"] or "track{:02d}".format(t["index"])
+        safe = safe_name(name)
+        fn = "{:0{w}d} {}.flac".format(t["index"], safe, w=width)
+        planned.append(dest / fn)
+
+    if not apply:
+        return audio, planned
+
+    total_len = None
+    for idx, (t, out) in enumerate(zip(tracks, planned), 1):
+        if out.exists():
+            if on_track:
+                try:
+                    on_track(idx, len(tracks), out, t, "已存在")
+                except Exception:
+                    pass  # allow-swallow: 回调里的日志出错不能中断切分
+            continue
+        t_track = _time.time()
+
+        # -ss 必须放在 -i **之后**（输出侧精确 seek）：
+        # 放前面是快速 seek，-c copy 只能落在 FLAC 帧边界上——
+        # 实测第一轨开头就偏了 0.17 秒（会把上一首的尾音带进来）。
+        # 重编码成 FLAC 是无损的：解码出的 PCM 与原区间逐字节相同，
+        # 只是不再复用具原文件的压缩块。这里要的是切得准，不是省时间。
+        args = [ffmpeg, "-y", "-v", "error", "-i", str(audio),
+                "-ss", "{:.6f}".format(t["start"]),
+                "-map", "0:a:0"]
+        if t["end"] is not None:
+            args += ["-t", "{:.6f}".format(t["end"] - t["start"])]
+        args += ["-c:a", "flac", "-compression_level", "8", str(out)]
+        r = run_hidden(args, capture_output=True, text=True)
+        if r.returncode != 0 or not out.exists():
+            raise RuntimeError("分割第 {} 轨失败：{}".format(t["index"], (r.stderr or "")[:200]))
+        # 写标签（标题/艺术家/专辑/曲目号）
+        try:
+            write_tag(out, "title", t["title"] or out.stem)
+            write_tag(out, "artist", t["performer"] or disc_perf or "")
+            write_tag(out, "album", disc_title or cue.stem)
+            write_tag(out, "tracknumber", "{:02d}".format(t["index"]))
+            if len(tracks) > 1:
+                write_tag(out, "totaltracks", str(len(tracks)))
+        except Exception:
+            pass  # allow-swallow: 标签写失败不影响音频本身
+
+        if on_track:
+            try:
+                on_track(idx, len(tracks), out, t,
+                         "{:.1f}s {:.0f}MB".format(_time.time() - t_track,
+                                                  out.stat().st_size / 1024 / 1024))
+            except Exception:
+                pass  # allow-swallow: 回调里的日志出错不能中断切分
+    return audio, planned
+
+
+def has_cover(p: Path, ext=None):
+    """判断音频是否已有封面；读不动抛异常。不支持的格式返回 None。
+
+    注意 ext：对「副本」做回读校验时必须传**原文件**扩展名，
+    否则 .tagtmp/.mbtmp 这类后缀会被判成不支持的格式（反复踩过）。
+    """
+    ext = (ext or p.suffix).lower()
+    if ext == ".flac":
+        return bool(FLAC(p).pictures)
+    # wav / dsf / dff / mp3 / aif / aiff 都在 ID3_FORMATS 里，统一走 APIC 判断。
+    # 这里判错会和 get_cover_bytes 打架 —— 列表里出现「缩略图有图但封面列打叉」
+    # 就是这个原因（2026-11-30 排查过），两者必须用同一套格式判断。
+    if ext in ID3_FORMATS:
+        opener, _need = _id3_opener(ext)
+        try:
+            obj = opener(str(p))
+        except Exception:
+            return False
+        tags = getattr(obj, "tags", None)
+        if tags is None:
+            return False
+        return any(k.startswith("APIC") for k in tags.keys())
+    return None
+
+
+def get_cover_bytes(p: Path, ext=None):
+    """取内嵌封面的原始字节（跨格式）；没有或读不到返回 None。
+
+    ext 同上：校验临时副本时传原文件扩展名。
+    """
+    ext = (ext or p.suffix).lower()
+    try:
+        if ext == ".flac":
+            f = FLAC(p)
+            return f.pictures[0].data if f.pictures else None
+        if ext in ID3_FORMATS:
+            opener, _need = _id3_opener(ext)
+            obj = opener(str(p))
+            t = getattr(obj, "tags", None)
+            if t is None:
+                return None
+            for k in t.keys():
+                if k.startswith("APIC"):
+                    return t[k].data
+            return None
+        if ext == ".wav":
+            from mutagen.wave import WAVE
+            w = WAVE(str(p))
+            if w.tags:
+                for k in w.tags.keys():
+                    if k.startswith("APIC"):
+                        return w.tags[k].data
+            return None
+        if ext in (".dsf", ".dff"):
+            from mutagen.dsf import DSF
+            d = DSF(str(p))
+            if d.tags:
+                for k in d.tags.keys():
+                    if k.startswith("APIC"):
+                        return d.tags[k].data
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def embed_cover(p: Path, img_path: Path, max_px=700, quality=86):
+    """给 FLAC / MP3 写封面（覆盖原有封面）。
+
+    安全写法：先在**临时副本**上写，校验通过后才原子替换原文件。
+    原文件在这之前一个字节都不动，写坏了直接丢弃副本。
+    原因：mutagen 的 FLAC.save() 是在原文件里原地搬移音频数据来腾出
+    metadata 空间，U 盘（exFAT）上一旦中断就把音频截断——2026-11-24 已实测
+    把张雨生《大海》里的一个文件写成了 6 秒。
+    """
+    import io
+    from PIL import Image
+    ext = p.suffix.lower()
+    if ext != ".flac" and ext not in ID3_FORMATS:
+        raise RuntimeError("格式不支持: {}".format(ext))
+
+    before = p.stat().st_size
+    tmp = p.with_name(p.name + ".mbtmp")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    try:
+        shutil.copy2(str(p), str(tmp))
+
+        if ext == ".flac":
+            from mutagen.flac import Picture
+            f = open_flac(tmp)
+            if f is None:
+                raise RuntimeError("FLAC 打不开")
+            im = Image.open(img_path).convert("RGB")
+            if max(im.size) > max_px:
+                im.thumbnail((max_px, max_px), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            while f.pictures:
+                f.clear_pictures()
+            pic = Picture()
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            pic.desc = "Cover"
+            pic.data = buf.getvalue()
+            # width/height/depth 必须填：留空会写成 0x0，
+            # Windows 资源管理器靠这几个字段画缩略图，0x0 就不显示了（实测）。
+            pic.width = im.width
+            pic.height = im.height
+            pic.depth = 24          # RGB = 每像素 24 位
+            f.add_picture(pic)
+            f.save()
+        else:
+            # MP3 / WAV / DSF / DFF / AIFF：统一走 ID3v2 的 APIC
+            from mutagen.id3 import ID3, APIC
+            opener, need_add = _id3_opener(ext)
+            obj = opener(str(tmp))
+            if getattr(obj, "tags", None) is None:
+                if need_add:
+                    obj.add_tags()
+                else:
+                    obj.tags = ID3()
+            im = Image.open(img_path).convert("RGB")
+            if max(im.size) > max_px:
+                im.thumbnail((max_px, max_px), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            obj.tags.delall("APIC")
+            obj.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover",
+                              data=buf.getvalue()))
+            obj.save()
+
+        # 校验副本：文件不能变小、必须能正常解析、封面必须到位
+        after = tmp.stat().st_size
+        if after < before:
+            raise RuntimeError("副本比原文件小（{} < {}），已放弃替换".format(after, before))
+        if ext == ".flac":
+            chk = FLAC(str(tmp))
+            if not chk.pictures:
+                raise RuntimeError("副本读不到封面，已放弃替换")
+            if chk.info.length <= 0:
+                raise RuntimeError("副本音频参数异常，已放弃替换")
+            if abs(chk.info.length - FLAC(str(p)).info.length) > 0.05:
+                raise RuntimeError("副本时长与原文件不一致，已放弃替换")
+        else:
+            if not has_cover(tmp, ext=ext):
+                raise RuntimeError("副本读不到 APIC，已放弃替换")
+
+        os.replace(str(tmp), str(p))   # 同盘原子替换
+        return True
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------- 命名模板
+# 用户可自定义文件名模板，变量用 <名字> 或 {名字}，两种写法都认。
+# 默认值保持原来的规则：普通「标题 - 演出者 - 专辑」，古典「标题 - 作曲家」。
+DEFAULT_TEMPLATE_POP = "{标题} - {演出者} - {专辑}"
+DEFAULT_TEMPLATE_CLASSICAL = "{标题} - {作曲家}"
+
+TEMPLATE_VARS = {
+    "标题": ("title",), "title": ("title",),
+    "演出者": ("artist", "albumartist"), "艺术家": ("artist", "albumartist"),
+    "歌手": ("artist", "albumartist"), "artist": ("artist", "albumartist"),
+    "专辑": ("album",), "album": ("album",),
+    "作曲家": ("composer",), "composer": ("composer",),
+    "音轨号": ("tracknumber",), "track": ("tracknumber",), "tracknumber": ("tracknumber",),
+    "碟号": ("discnumber",), "disc": ("discnumber",),
+    "年份": ("date", "year"), "year": ("date", "year"),
+    "流派": ("genre",), "genre": ("genre",),
+}
+# 特殊变量（不从标签取）
+TEMPLATE_SPECIAL = ("原名", "stem", "filename", "格式", "ext")
+
+NAME_TOKEN = re.compile(r"([<{]([^<>{}]+)[>}])")
+SEP_RUN = re.compile(r"(\s*[-–—_]\s*){2,}")
+
+
+def template_vars_help():
+    """给界面用：可用的变量清单（中文名优先）。"""
+    names = ["标题", "演出者", "专辑", "作曲家", "音轨号", "碟号", "年份", "流派", "原名", "格式"]
+    return "、".join("<{}>".format(n) for n in names)
+
+
+def render_name_template(tag_getter, template, stem="", ext=""):
+    """按模板生成文件名主体。tag_getter(key) 返回标签字符串（没有返回空）。
+
+    空变量会连同它旁边的分隔符一起收掉，不会留下「 - - 」这种残渣。
+    """
+    template = (template or "").strip()
+    if not template:
+        return ""
+
+    def resolve(name):
+        key = name.strip()
+        if key in ("原名", "stem", "filename"):
+            return stem or ""
+        if key in ("格式", "ext"):
+            return (ext or "").lstrip(".")
+        keys = TEMPLATE_VARS.get(key)
+        if not keys:
+            return ""
+        for k in keys:
+            v = tag_getter(k)
+            if v:
+                return str(v).strip()
+        return ""
+
+    pieces = []
+    pos = 0
+    for m in NAME_TOKEN.finditer(template):
+        if m.start() > pos:
+            pieces.append(("lit", template[pos:m.start()]))
+        pieces.append(("var", resolve(m.group(2))))
+        pos = m.end()
+    if pos < len(template):
+        pieces.append(("lit", template[pos:]))
+
+    out = []
+    for kind, s in pieces:
+        if kind == "var":
+            out.append(s or "")
+        else:
+            # 字面段里的分隔符：如果前后都是空变量，这里可能留下冗余
+            out.append(s)
+    text = "".join(out)
+
+    # 收拾空变量留下的残渣：连续分隔符合成一个，首尾分隔符去掉
+    text = SEP_RUN.sub(" - ", text)
+    text = re.sub(r"^\s*[-–—_]\s*", "", text)
+    text = re.sub(r"\s*[-–—_]\s*$", "", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" .")
+    return text
+
+
+def build_name_by_template(f, template, stem="", ext=""):
+    """对某个 mutagen 对象套用模板；返回清理后的文件名主体。"""
+
+    def get(key):
+        v = f.get(key) if hasattr(f, "get") else None
+        if not v:
+            return ""
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else ""
+        s = str(v).strip()
+        if key == "tracknumber":
+            # 曲目号补零到两位，便于排序
+            m = re.match(r"(\d+)", s)
+            if m:
+                return m.group(1).zfill(2)
+        if key == "date":
+            return s[:4]
+        return s
+
+    return render_name_template(get, template, stem=stem, ext=ext)
+
+TAG_FIELDS = {
+    "title":  ("title",  "TIT2"),
+    "artist": ("artist", "TPE1"),
+    "album":  ("album",  "TALB"),
+    "albumartist": ("albumartist", "TPE2"),
+    "date":   ("date",   "TDRC"),
+    "genre":  ("genre",  "TCON"),
+    "tracknumber": ("tracknumber", "TRCK"),
+}
+
+# 能写标签的格式：flac 走 Vorbis comment，其余走 ID3v2
+ID3_FORMATS = {".mp3", ".wav", ".dsf", ".dff", ".aif", ".aiff"}
+SUPPORTED_TAG_FORMATS = {".flac"} | ID3_FORMATS
+
+
+def editable_fields(p):
+    """这个文件能改哪些标签字段；空列表表示该格式不支持。"""
+    if p.suffix.lower() in SUPPORTED_TAG_FORMATS:
+        return list(TAG_FIELDS)
+    return []
+
+
+class _Mp3Id3(object):
+    """把裸 ID3 对象包装成和 WAVE/DSF 一样的「有 .tags + .save()」接口。"""
+
+    def __init__(self, path):
+        from mutagen.id3 import ID3
+        try:
+            self.tags = ID3(path)
+        except Exception:
+            self.tags = ID3()
+
+    def add_tags(self):
+        pass
+
+    def save(self):
+        self.tags.save()
+
+
+def _id3_opener(ext):
+    """按扩展名返回 (打开函数, 是否需要 add_tags)。注意 ext 要传原文件扩展名，
+    不能用临时副本的 .tagtmp，否则格式判断会失效。"""
+    ext = (ext or "").lower()
+    if ext == ".mp3":
+        return _Mp3Id3, False
+    if ext == ".wav":
+        from mutagen.wave import WAVE
+        return (lambda path: WAVE(path)), True
+    if ext in (".dsf", ".dff"):
+        from mutagen.dsf import DSF
+        return (lambda path: DSF(path)), True
+    if ext in (".aif", ".aiff"):
+        from mutagen.aiff import AIFF
+        return (lambda path: AIFF(path)), True
+    raise RuntimeError("不支持的格式: {}".format(ext))
+
+
+def _apply_id3(obj, frame_key, value, need_add):
+    from mutagen.id3 import TIT2, TPE1, TALB, TPE2, TDRC, TCON, TRCK
+    cls = {"TIT2": TIT2, "TPE1": TPE1, "TALB": TALB,
+           "TPE2": TPE2, "TDRC": TDRC, "TCON": TCON, "TRCK": TRCK}[frame_key]
+    if obj.tags is None:
+        if not need_add:
+            from mutagen.id3 import ID3
+            obj.tags = ID3()
+        else:
+            obj.add_tags()
+    obj.tags.delall(frame_key)
+    if value:
+        obj.tags.add(cls(encoding=3, text=[value]))
+    obj.save()
+
+
+def _read_id3_value(p, frame_key, ext):
+    try:
+        opener, _need = _id3_opener(ext)
+        obj = opener(str(p))
+        if obj.tags is None:
+            return ""
+        fr = obj.tags.get(frame_key)
+        if fr is None:
+            return ""
+        txt = getattr(fr, "text", None)
+        return str(txt[0]) if txt else ""
+    except Exception:
+        return ""
+
+
+def read_tag(p: Path, field: str, ext: str = None):
+    """统一读取一个标签字段（跨格式）。ext 缺省按 p 的扩展名，读临时副本时要显式传。"""
+    if field not in TAG_FIELDS:
+        return ""
+    flac_key, id3_key = TAG_FIELDS[field]
+    ext = (ext or p.suffix).lower()
+    try:
+        if ext == ".flac":
+            f = FLAC(str(p))
+            v = (f.get(flac_key) or [""])[0]
+            return str(v)
+        if ext in ID3_FORMATS:
+            return _read_id3_value(p, id3_key, ext)
+    except Exception:
+        pass
+    return ""
+
+
+def write_tag(p: Path, field: str, value: str):
+    """安全地写一个标签字段（跨格式）：副本上写 → 回读校验 → 原子替换。
+
+    FLAC 用 Vorbis comment；MP3 / WAV / DSF / DFF / AIFF 用 ID3v2 帧
+    （WAV 与 DSF 原本没有标签容器时会先 add_tags 建一个）。
+    原文件在成功前不会被改动；格式不支持时抛 RuntimeError。
+    """
+    if field not in TAG_FIELDS:
+        raise ValueError("不支持的字段: {}（可用：{}）".format(field, "/".join(TAG_FIELDS)))
+    flac_key, id3_key = TAG_FIELDS[field]
+    ext = p.suffix.lower()
+    if ext not in SUPPORTED_TAG_FORMATS:
+        raise RuntimeError("该格式（{}）暂不支持编辑标签".format(ext or "无扩展名"))
+
+    before = p.stat().st_size
+    tmp = p.with_name(p.name + ".tagtmp")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    value = (value or "").strip()
+    try:
+        shutil.copy2(str(p), str(tmp))
+
+        if ext == ".flac":
+            f = FLAC(str(tmp))
+            if value:
+                f[flac_key] = value
+            elif flac_key in (f.tags or {}):
+                del f[flac_key]
+            f.save()
+        else:
+            opener, need_add = _id3_opener(ext)
+            obj = opener(str(tmp))
+            _apply_id3(obj, id3_key, value, need_add)
+
+        got = read_tag(tmp, field, ext=ext)
+        if value and got != value:
+            raise RuntimeError("回读校验失败（写入 {!r} 读出 {!r}），已放弃替换".format(value, got))
+        if tmp.stat().st_size < before * 0.5:
+            raise RuntimeError("副本异常变小（{} -> {}），已放弃替换".format(before, tmp.stat().st_size))
+        os.replace(str(tmp), str(p))
+        return True
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def rename_file(p: Path, new_stem: str, dry=False):
+    """只改文件名（保留扩展名与所在目录）。返回新路径；dry 时只返回目标路径。"""
+    new_stem = safe_name(new_stem)
+    if not new_stem:
+        raise ValueError("新文件名不能为空")
+    dst = p.with_name(new_stem + p.suffix)
+    if dst == p:
+        return p
+    if dst.exists():
+        raise RuntimeError("同目录已存在同名文件：{}".format(dst.name))
+    if not dry:
+        p.rename(dst)
+    return dst
 
 
 # ---------------------------------------------------------------- scan
@@ -187,8 +1036,18 @@ def build_name(f, mode):
     return base or "", classical
 
 
+def template_for(mode, classical, custom=None):
+    """决定用哪个模板：命令行/界面给了自定义模板就用它，否则用内置默认。"""
+    if custom:
+        return custom
+    if mode == "classical" or (mode == "auto" and classical):
+        return DEFAULT_TEMPLATE_CLASSICAL
+    return DEFAULT_TEMPLATE_POP
+
+
 def cmd_rename(args, log):
     root = Path(args.root)
+    assert_writable(root, getattr(args, "apply", False), log)
     plan = []
     stats = {"classical": 0, "pop": 0, "same": 0}
 
@@ -197,6 +1056,13 @@ def cmd_rename(args, log):
         if f is None:
             continue
         base, classical = build_name(f, args.mode)
+        if getattr(args, "template", None):
+            tpl_name = build_name_by_template(
+                f, args.template, stem=p.stem, ext=p.suffix)
+            if tpl_name:
+                base = tpl_name
+            else:
+                stats["tpl_empty"] = stats.get("tpl_empty", 0) + 1
         if not base:
             base = p.stem
         stats["classical" if classical else "pop"] += 1
@@ -217,6 +1083,7 @@ def cmd_rename(args, log):
             seen[key] = 1
 
     log("rename", "计划", total=len(plan), 古典=stats["classical"],
+        模板无值=stats.get("tpl_empty", 0), 模板=(args.template or "（默认）"),
         普通=stats["pop"], 已合规=stats["same"], apply=args.apply)
     for src, dst, kind in plan[: args.show]:
         log("rename", "{} -> {}".format(src.name, dst.name), 类型=kind)
@@ -239,6 +1106,7 @@ def cmd_rename(args, log):
 # ---------------------------------------------------------------- flatten
 def cmd_flatten(args, log):
     root = Path(args.root)
+    assert_writable(root, getattr(args, "apply", False), log)
     moved = 0
     plan = []
     for album in sorted([d for d in root.rglob("*") if d.is_dir()]):
@@ -286,47 +1154,89 @@ def cmd_flatten(args, log):
 # ---------------------------------------------------------------- cover
 def cmd_cover(args, log):
     root = Path(args.root)
-    from PIL import Image
-
+    assert_writable(root, getattr(args, "apply", False), log)
     default_img = Path(args.image) if args.image else None
-    embedded = skipped = failed = 0
-    for p in iter_flac(root):
-        f = open_flac(p)
-        if f is None:
+
+    # 五个桶，一个桶只装一种含义，互不重叠：
+    #   write       本次写入成功（或 dry-run 下"将会写入"）
+    #   have        本来就有封面，正确跳过 —— 是"已完成"
+    #   no_img      没有任何可用图片 —— 是"没做"，不是跳过
+    #   unsupported 格式不支持（DSF/WAV…）—— 既不是失败也不是跳过
+    #   failed      读取/写入真的出错
+    stat = {"write": 0, "have": 0, "no_img": 0, "unsupported": 0, "failed": 0,
+            "downmix_scan": 0}
+    no_img_dirs = {}          # 目录 -> [文件名]
+    unsupported_ext = {}      # 扩展名 -> [文件名]
+    failed_list = []
+
+    def audio_files():
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and p.suffix.lower() in AUDIO_EXT:
+                yield p
+
+    for p in audio_files():
+        rel = str(p.relative_to(root))
+        if DOWNMIX_DIRNAME in p.parts:
+            stat["downmix_scan"] += 1
+        ext = p.suffix.lower()
+        try:
+            have = has_cover(p)
+        except Exception as exc:
+            stat["failed"] += 1
+            failed_list.append((rel, "读取标签失败: {}".format(exc)))
             continue
-        if f.pictures and not args.overwrite:
-            skipped += 1
+        if have is None:
+            stat["unsupported"] += 1
+            unsupported_ext.setdefault(ext, []).append(rel)
             continue
-        img_path = default_img or (p.parent / "cover.jpg")
-        if not img_path or not img_path.is_file():
-            skipped += 1
+        if have and not args.overwrite:
+            stat["have"] += 1
+            continue
+
+        img_path, why, io_error = (default_img, "命令行指定", False)
+        if img_path is None:
+            img_path, why, io_error = find_cover_image(p, root)
+        if img_path is None:
+            if io_error:
+                stat["failed"] += 1
+                failed_list.append((rel, why))
+            else:
+                stat["no_img"] += 1
+                d = str(p.parent.relative_to(root)) or "."
+                no_img_dirs.setdefault(d, []).append(p.name)
             continue
         try:
-            raw = Image.open(img_path).convert("RGB")
-            if max(raw.size) > args.max_px:
-                raw.thumbnail((args.max_px, args.max_px), Image.LANCZOS)
-            import io
-            buf = io.BytesIO()
-            raw.save(buf, format="JPEG", quality=args.quality, optimize=True)
-            data = buf.getvalue()
             if not args.apply:
-                embedded += 1
+                stat["write"] += 1
+                log("cover", "将写入", file=rel, 图=img_path.name, 来源=why)
                 continue
-            while f.pictures:
-                f.clear_pictures()
-            pic = Picture()
-            pic.type = 3
-            pic.mime = "image/jpeg"
-            pic.desc = "Cover"
-            pic.data = data
-            f.add_picture(pic)
-            f.save()
-            embedded += 1
+            embed_cover(p, img_path, args.max_px, args.quality)
+            stat["write"] += 1
+            log("cover", "写入", file=rel, 图=img_path.name, 来源=why)
         except Exception as exc:
-            failed += 1
-            log("cover", "失败", file=str(p), error=str(exc))
-    log("cover", "结束", 处理=embedded, 跳过=skipped, 失败=failed,
+            stat["failed"] += 1
+            failed_list.append((rel, "{}: {}".format(why, exc)))
+
+    log("cover", "结束",
+        写入=stat["write"], 已有封面=stat["have"], 无图=stat["no_img"],
+        不支持格式=stat["unsupported"], 失败=stat["failed"],
+        其中5dot1降混目录=stat["downmix_scan"],
         模式="dry-run" if not args.apply else "apply")
+    log("cover", "口径说明",
+        含义="写入=本次写好；已有封面=本来就有的正确跳过（已完成）；"
+             "无图=目录链上没有可用图片（是没做，不是跳过）；"
+             "不支持格式=工具不写该格式，不算失败；失败=读写真的出错")
+
+    # 每个桶都下钻到具体文件，不做「前 N 条」截断
+    for ext in sorted(unsupported_ext):
+        files = unsupported_ext[ext]
+        log("cover", "不支持格式", 扩展名=ext, 数量=len(files),
+            files="; ".join(files))
+    for d in sorted(no_img_dirs, key=lambda k: -len(no_img_dirs[k])):
+        files = no_img_dirs[d]
+        log("cover", "无图目录", 目录=d, 数量=len(files), files="; ".join(files))
+    for f, why in failed_list:
+        log("cover", "失败明细", file=f, reason=why)
     return 0
 
 
@@ -338,6 +1248,7 @@ PAN = ("[0:a]pan=stereo|"
 
 def cmd_downmix(args, log):
     root = Path(args.root)
+    assert_writable(root, getattr(args, "apply", False), log)
     ff = args.ffmpeg or shutil.which("ffmpeg")
     if not ff:
         log("downmix", "找不到 ffmpeg，用 --ffmpeg 指定")
@@ -361,7 +1272,7 @@ def cmd_downmix(args, log):
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            r = subprocess.run([ff, "-y", "-v", "error", "-i", str(src),
+            r = run_hidden([ff, "-y", "-v", "error", "-i", str(src),
                                 "-filter_complex", PAN, "-map", "[a]",
                                 "-c:a", "flac", "-sample_fmt", "s32", str(dst)],
                                capture_output=True, text=True, timeout=900)
@@ -383,6 +1294,7 @@ def cmd_downmix(args, log):
 def cmd_cleanup(args, log):
     """删旧文件：按声道分别计数，新集覆盖旧集才删；不匹配一律保留。"""
     root = Path(args.root)
+    assert_writable(root, getattr(args, "apply", False) and getattr(args, "force", False), log)
     old_rate = int(args.old_rate)
 
     def norm(s):
@@ -575,6 +1487,7 @@ def _pick(cands, duration=None):
 
 def cmd_lyrics(args, log):
     root = Path(args.root)
+    assert_writable(root, getattr(args, "apply", False), log)
     want_lrc = args.save_lrc
     done = skip = miss = fail = 0
     for p in iter_flac(root):
@@ -723,40 +1636,81 @@ def to_lrc(items):
 
 CONVERTERS = {"lrc": to_lrc, "srt": to_srt, "ass": to_ass, "txt": to_txt}
 
+LYRIC_INPUT_EXT = (".lrc", ".srt", ".ass", ".ssa", ".smi", ".ksc", ".txt")
+
 
 def cmd_lyricfmt(args, log):
+    """歌词多格式互转 + 中文处理（引擎见 lyriceng.py）。"""
+    import lyriceng
+
     src = Path(args.root)
-    files = [src] if src.is_file() else [p for p in src.rglob("*.lrc") if p.is_file()]
+    if src.is_file():
+        files = [src]
+    else:
+        files = [p for p in src.rglob("*")
+                 if p.is_file() and p.suffix.lower() in LYRIC_INPUT_EXT]
+        # TXT 只在与其它歌词同目录且显式要求时才处理，避免把普通文本也当歌词
+        if not getattr(args, "include_txt", False):
+            files = [p for p in files if p.suffix.lower() != ".txt"]
     if not files:
-        log("lyricfmt", "没有找到 .lrc 文件", root=str(src))
+        log("lyricfmt", "没有找到歌词文件", root=str(src),
+            ext=",".join(LYRIC_INPUT_EXT))
         return 0
+
     outdir = Path(args.out) if args.out else None
     if outdir:
         outdir.mkdir(parents=True, exist_ok=True)
-    done = 0
-    for p in files:
+        # 输出目录若在输入目录里面，必须把它排除，否则会把刚生成的产物当输入再转一遍
         try:
-            text = p.read_text(encoding=args.encoding, errors="replace")
+            od = outdir.resolve()
+            files = [p for p in files if not str(p.resolve()).startswith(str(od))]
+        except Exception:
+            pass
+
+    done = 0
+    stat = {"files": 0, "no_time": 0, "failed": 0, "written": 0}
+    for p in files:
+        stat["files"] += 1
+        try:
+            text, used_enc = lyriceng.read_lyric(p, args.encoding or None)
         except Exception as exc:
-            log("lyricfmt", "读取失败 {}".format(exc), file=str(p))
+            stat["failed"] += 1
+            log("lyricfmt", "读取失败", file=p.name, error=str(exc))
             continue
-        items = lrc_parse(text)
-        if not items:
-            log("lyricfmt", "无时间标签，跳过 {}".format(p.name[:50]))
+        src_fmt = args.src if args.src != "auto" else (p.suffix.lower().lstrip(".") or "auto")
+        if src_fmt == "ssa":
+            src_fmt = "ass"
+        ly = lyriceng.process(
+            text, src_fmt=src_fmt,
+            offset=args.offset, do_strip_ads=args.strip_ads,
+            hans=args.to_hans, hant=args.to_hant,
+            pinyin=args.pinyin, do_split=args.split, do_merge=args.merge,
+        )
+        if not ly.lines:
+            stat["no_time"] += 1
+            log("lyricfmt", "解析不出歌词行", file=p.name, 编码=used_enc, 源格式=src_fmt)
             continue
-        items = lrc_clean(items, args.offset, args.strip_ads)
         for fmt in args.to:
-            conv = CONVERTERS.get(fmt)
-            if not conv:
+            try:
+                body = lyriceng.render(ly, fmt, title=p.stem)
+            except Exception as exc:
+                stat["failed"] += 1
+                log("lyricfmt", "生成失败", file=p.name, fmt=fmt, error=str(exc))
                 continue
-            body = conv(items) if fmt != "ass" else conv(items, title=p.stem)
             dst = (outdir or p.parent) / (p.stem + "." + fmt)
-            log("lyricfmt", "{} -> {}  {} 行".format(p.name[:40], dst.name, len(items)))
+            log("lyricfmt", "{} -> {}  {} 行  (源编码 {})".format(
+                p.name[:36], dst.name, len(ly.lines), used_enc))
             if args.apply:
                 dst.write_text(body, encoding="utf-8")
+                stat["written"] += 1
                 done += 1
-    log("lyricfmt", "结束", 文件=len(files), 输出=done,
-        格式=",".join(args.to), 偏移=args.offset, 去广告=args.strip_ads,
+
+    log("lyricfmt", "结束",
+        文件=stat["files"], 输出=stat["written"], 无可用行=stat["no_time"],
+        失败=stat["failed"], 输出格式=",".join(args.to),
+        偏移=args.offset, 去广告=args.strip_ads,
+        简繁="→简" if args.to_hans else ("→繁" if args.to_hant else "不变"),
+        拼音=args.pinyin or "不加", 拆分=args.split, 合并=args.merge,
         模式="apply" if args.apply else "dry-run")
     return 0
 
@@ -795,10 +1749,13 @@ def main(argv=None):
     p.add_argument("--out", help="报告输出目录")
     p.set_defaults(func=cmd_scan)
 
-    p = sub.add_parser("rename", help="规范命名")
+    p = sub.add_parser("rename", help="规范命名（可自定义模板）")
     common(p)
     p.add_argument("--mode", choices=["auto", "pop", "classical"], default="auto")
     p.add_argument("--max-len", type=int, default=150)
+    p.add_argument("--template", help="文件名模板，如 \"{标题} - {演出者}\"；"
+                                      "可用变量见 --template 说明（默认：普通=标题-演出者-专辑，古典=标题-作曲家）")
+    p.add_argument("--show-vars", action="store_true", help="打印可用模板变量后退出")
     p.set_defaults(func=cmd_rename)
 
     p = sub.add_parser("flatten", help="目录扁平化")
@@ -832,12 +1789,24 @@ def main(argv=None):
     p.add_argument("--out", help="报告输出目录")
     p.set_defaults(func=cmd_verify)
 
-    p = sub.add_parser("lyricfmt", help="歌词格式互转与清洗（LRC -> SRT/ASS/TXT/LRC）")
-    p.add_argument("--root", required=True, help=".lrc 文件或含 .lrc 的目录")
+    p = sub.add_parser("lyricfmt", help="歌词多格式互转与中文处理（LRC/SRT/ASS/SMI/KSC ↔ LRC/SRT/ASS/TXT）")
+    p.add_argument("--root", required=True, help="歌词文件，或含歌词的目录")
+    p.add_argument("--src", default="auto",
+                   choices=["auto", "lrc", "srt", "ass", "ssa", "smi", "ksc", "txt"],
+                   help="输入格式，默认按扩展名自动判断")
     p.add_argument("--to", nargs="+", default=["srt"], choices=["lrc", "srt", "ass", "txt"])
     p.add_argument("--offset", type=float, default=0.0, help="时间整体偏移秒数，可负数")
-    p.add_argument("--strip-ads", action="store_true", help="删除广告/来源行")
-    p.add_argument("--encoding", default="utf-8", help="源文件编码，如 gbk")
+    p.add_argument("--strip-ads", action="store_true", help="删除广告/来源/网址行")
+    p.add_argument("--to-hans", action="store_true", help="转简体")
+    p.add_argument("--to-hant", action="store_true", help="转繁体")
+    p.add_argument("--pinyin", choices=["both", "append", "only"],
+                   help="加拼音：both=下行拼音 / append=同行括号 / only=只留拼音")
+    p.add_argument("--split", action="store_true", help="长句按标点拆成多行")
+    p.add_argument("--merge", action="store_true", help="短句合并成一行")
+    p.add_argument("--encoding", default=None,
+                   help="源文件编码；默认自动识别 UTF-8/UTF-16/GBK/Big5")
+    p.add_argument("--include-txt", action="store_true",
+                   help="把 .txt 也当歌词处理（默认跳过，避免误伤普通文本）")
     p.add_argument("--out", help="输出目录（默认与源同目录）")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--log")
@@ -853,10 +1822,16 @@ def main(argv=None):
     p.set_defaults(func=cmd_lyrics)
 
     args = ap.parse_args(argv)
+    if getattr(args, "show_vars", False):
+        print("可用变量：" + template_vars_help())
+        return 0
 
     root = Path(args.root)
-    if not root.is_dir():
-        sys.stderr.write("根目录不存在或不是目录: {}\n".format(root))
+    # lyricfmt 允许直接指向单个歌词文件，其余子命令要求目录
+    accepts_file = args.cmd in ("lyricfmt",)
+    if not (root.is_dir() or (accepts_file and root.is_file())):
+        sys.stderr.write("路径不存在或类型不对（{}）: {}\n".format(
+            "文件或目录" if accepts_file else "需要目录", root))
         return 2
 
     log = Log(Path(args.log) if args.log else None, quiet=args.quiet)
